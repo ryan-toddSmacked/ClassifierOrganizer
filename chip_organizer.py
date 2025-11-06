@@ -162,8 +162,35 @@ class ChipOrganizerApp(QMainWindow):
         ontology_group = QGroupBox("Classification Categories")
         ontology_layout = QVBoxLayout(ontology_group)
         
+        # Add sort checkbox
+        self.sort_labels_checkbox = QCheckBox("Sort labels alphabetically")
+        self.sort_labels_checkbox.setChecked(False)
+        self.sort_labels_checkbox.stateChanged.connect(self.update_category_list)
+        ontology_layout.addWidget(self.sort_labels_checkbox)
+        
         self.category_list = QListWidget()
         self.category_list.itemClicked.connect(self.classify_current_image)
+        # Add spacing between items to prevent misclicks
+        self.category_list.setSpacing(3)
+        # Style items to look like buttons with borders (removed green selection)
+        self.category_list.setStyleSheet("""
+            QListWidget::item {
+                padding: 6px;
+                margin: 1px 2px;
+                border: 2px solid #2196F3;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QListWidget::item:hover {
+                background-color: #e3f2fd;
+                border-color: #1976D2;
+            }
+            QListWidget::item:selected {
+                background-color: #e3f2fd;
+                border-color: #1976D2;
+                color: black;
+            }
+        """)
         ontology_layout.addWidget(self.category_list)
         
         # Add/Remove label buttons
@@ -323,6 +350,10 @@ class ChipOrganizerApp(QMainWindow):
         
         # Get categories using utility function
         categories = get_categories_from_ontology(self.ontology)
+        
+        # Sort alphabetically if checkbox is checked
+        if hasattr(self, 'sort_labels_checkbox') and self.sort_labels_checkbox.isChecked():
+            categories = sorted(categories, key=lambda x: str(x).lower())
         
         for category in categories:
             label = format_category_label(category)
@@ -686,14 +717,8 @@ class ChipOrganizerApp(QMainWindow):
             self.classifications = progress_data.get('classifications', {})
             self.ontology = progress_data.get('ontology', {})
             
-            # Reload images from source directory
-            # Use a set to avoid duplicates on case-insensitive file systems (Windows)
-            image_files_set = set()
-            for ext in self.SUPPORTED_FORMATS:
-                image_files_set.update(self.source_directory.glob(f"*{ext}"))
-                image_files_set.update(self.source_directory.glob(f"*{ext.upper()}"))
-            
-            self.image_files = sorted(list(image_files_set))
+            # Reload images from source directory using utility function
+            self.image_files = find_image_files(self.source_directory, SUPPORTED_FORMATS)
             
             # Update UI
             self.update_category_list()
