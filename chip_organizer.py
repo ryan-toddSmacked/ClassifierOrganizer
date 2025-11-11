@@ -6,14 +6,15 @@ import os
 import json
 import shutil
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QListWidget, QSplitter,
-    QGroupBox, QCheckBox, QScrollArea, QInputDialog, QListWidgetItem
+    QGroupBox, QCheckBox, QScrollArea, QInputDialog, QListWidgetItem,
+    QGridLayout, QFrame, QShortcut
 )
-from PyQt5.QtCore import Qt, QSettings
-from PyQt5.QtGui import QPixmap, QImage, QColor, QBrush
+from PyQt5.QtCore import Qt, QSettings, QSize
+from PyQt5.QtGui import QPixmap, QImage, QColor, QBrush, QKeySequence
 from dialogs import RemoveLabelDialog, AddLabelDialog
 from utils import find_image_files, parse_labels_from_text, get_categories_from_ontology, format_category_label
 from constants import (
@@ -21,6 +22,42 @@ from constants import (
     MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT, FILE_LIST_MAX_WIDTH,
     COLOR_LABELED, COLOR_UNLABELED, COLOR_CURRENT
 )
+
+
+class ClickableImageLabel(QLabel):
+    """A clickable image label for grid view."""
+    
+    def __init__(self, image_path: Path, app_instance):
+        super().__init__()
+        self.image_path = image_path
+        self.app_instance = app_instance
+        self.is_selected = False
+        self.is_labeled = False
+        self.setFrameStyle(QFrame.Box)
+        self.setLineWidth(3)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(150, 150)
+        self.setMaximumSize(200, 200)
+        self.setScaledContents(False)
+        self.update_border()
+    
+    def mousePressEvent(self, event):
+        """Handle mouse click to label image with selected category."""
+        if self.app_instance and hasattr(self.app_instance, 'on_image_clicked'):
+            self.app_instance.on_image_clicked(self)
+        super().mousePressEvent(event)
+    
+    def set_labeled(self, labeled: bool):
+        """Mark this image as labeled."""
+        self.is_labeled = labeled
+        self.update_border()
+    
+    def update_border(self):
+        """Update border color based on state."""
+        if self.is_labeled:
+            self.setStyleSheet("QLabel { border: 3px solid green; background-color: rgba(0, 255, 0, 0.2); }")
+        else:
+            self.setStyleSheet("QLabel { border: 3px solid gray; }")
 
 
 class ChipOrganizerApp(QMainWindow):
@@ -37,6 +74,13 @@ class ChipOrganizerApp(QMainWindow):
         self.ontology: Dict = {}
         self.classifications: Dict[str, str] = {}  # filename -> category
         self.source_directory: Optional[Path] = None
+        
+        # Grid state
+        self.grid_size: tuple = (8, 4)  # columns x rows (configurable)
+        self.grid_start_index: int = 0
+        self.grid_labels: Dict[ClickableImageLabel, Path] = {}
+        self.current_category: Optional[str] = None  # Currently selected category for labeling
+        self.zoom_level: float = 1.0  # Zoom level (1.0 = 100%)
         
         # Settings
         self.settings = QSettings(APP_NAME, APP_NAME)
@@ -83,6 +127,16 @@ class ChipOrganizerApp(QMainWindow):
         self.copy_mode_checkbox.setToolTip("Copy files (uncheck to move files)")
         toolbar_layout.addWidget(self.copy_mode_checkbox)
         
+        # Grid dimension settings
+        grid_size_label = QLabel("Grid:")
+        toolbar_layout.addWidget(grid_size_label)
+        
+        self.cols_input = QInputDialog()
+        self.cols_btn = QPushButton(f"{self.grid_size[0]}×{self.grid_size[1]}")
+        self.cols_btn.clicked.connect(self.configure_grid_size)
+        self.cols_btn.setToolTip("Configure grid dimensions (columns × rows)")
+        toolbar_layout.addWidget(self.cols_btn)
+        
         toolbar_layout.addStretch()
         main_layout.addLayout(toolbar_layout)
         
@@ -104,54 +158,66 @@ class ChipOrganizerApp(QMainWindow):
         
         splitter.addWidget(left_widget)
         
-        # Center - Image display
+        # Center - Grid view display
         center_widget = QWidget()
         center_layout = QVBoxLayout(center_widget)
         
-        # Image display area
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(600, 400)
-        self.image_label.setStyleSheet("QLabel { background-color: #333; border: 2px solid #666; }")
-        self.image_label.setScaledContents(False)
+        # Grid container with scroll
+        self.grid_scroll = QScrollArea()
+        self.grid_scroll.setWidgetResizable(True)
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setSpacing(10)
+        self.grid_scroll.setWidget(self.grid_container)
+        center_layout.addWidget(self.grid_scroll)
         
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(self.image_label)
-        scroll_area.setWidgetResizable(True)
-        center_layout.addWidget(scroll_area)
+        # Grid controls
+        grid_controls = QHBoxLayout()
         
-        # Image info
-        self.info_label = QLabel("No image loaded")
-        self.info_label.setStyleSheet("QLabel { padding: 5px; }")
-        center_layout.addWidget(self.info_label)
+        # Zoom controls
+        zoom_label = QLabel("Zoom:")
+        grid_controls.addWidget(zoom_label)
+        
+        self.zoom_out_btn = QPushButton("-")
+        self.zoom_out_btn.setMaximumWidth(30)
+        self.zoom_out_btn.setToolTip("Zoom Out (Ctrl+-)")
+        self.zoom_out_btn.clicked.connect(self.zoom_out)
+        grid_controls.addWidget(self.zoom_out_btn)
+        
+        self.zoom_level_label = QLabel("100%")
+        self.zoom_level_label.setMinimumWidth(50)
+        self.zoom_level_label.setAlignment(Qt.AlignCenter)
+        grid_controls.addWidget(self.zoom_level_label)
+        
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setMaximumWidth(30)
+        self.zoom_in_btn.setToolTip("Zoom In (Ctrl++)")
+        self.zoom_in_btn.clicked.connect(self.zoom_in)
+        grid_controls.addWidget(self.zoom_in_btn)
+        
+        self.zoom_reset_btn = QPushButton("Reset")
+        self.zoom_reset_btn.setMaximumWidth(60)
+        self.zoom_reset_btn.setToolTip("Reset Zoom (Ctrl+0)")
+        self.zoom_reset_btn.clicked.connect(self.zoom_reset)
+        grid_controls.addWidget(self.zoom_reset_btn)
+        
+        grid_controls.addSpacing(20)
+        
+        self.cycle_labeled_btn = QPushButton("Cycle Labeled Images")
+        self.cycle_labeled_btn.clicked.connect(self.cycle_labeled_images)
+        self.cycle_labeled_btn.setToolTip("Replace labeled images with new unlabeled ones")
+        grid_controls.addWidget(self.cycle_labeled_btn)
+        
+        grid_controls.addStretch()
+        center_layout.addLayout(grid_controls)
         
         # Classification status indicator
-        self.status_indicator = QLabel("Status: No image loaded")
+        self.status_indicator = QLabel("Status: Select a category from the right panel, then click images to label them")
         self.status_indicator.setAlignment(Qt.AlignCenter)
         self.status_indicator.setStyleSheet(
             "QLabel { padding: 8px; font-weight: bold; background-color: #e0e0e0; border: 2px solid #999; border-radius: 4px; }"
         )
         center_layout.addWidget(self.status_indicator)
-        
-        # Navigation and counter layout
-        nav_layout = QHBoxLayout()
-        self.prev_btn = QPushButton("← Previous")
-        self.prev_btn.clicked.connect(self.previous_image)
-        nav_layout.addWidget(self.prev_btn)
-        
-        # Image counter (replaces progress bar)
-        self.counter_label = QLabel("0 / 0")
-        self.counter_label.setAlignment(Qt.AlignCenter)
-        self.counter_label.setStyleSheet(
-            "QLabel { padding: 8px; font-size: 14px; font-weight: bold; background-color: #f5f5f5; border: 1px solid #ccc; border-radius: 4px; }"
-        )
-        nav_layout.addWidget(self.counter_label)
-        
-        self.next_btn = QPushButton("Next →")
-        self.next_btn.clicked.connect(self.next_image)
-        nav_layout.addWidget(self.next_btn)
-        
-        center_layout.addLayout(nav_layout)
         
         splitter.addWidget(center_widget)
         
@@ -235,15 +301,22 @@ class ChipOrganizerApp(QMainWindow):
         
         main_layout.addWidget(splitter)
         
+        # Setup keyboard shortcuts for zoom
+        self.zoom_in_shortcut = QShortcut(QKeySequence("Ctrl++"), self)
+        self.zoom_in_shortcut.activated.connect(self.zoom_in)
+        
+        self.zoom_out_shortcut = QShortcut(QKeySequence("Ctrl+-"), self)
+        self.zoom_out_shortcut.activated.connect(self.zoom_out)
+        
+        self.zoom_reset_shortcut = QShortcut(QKeySequence("Ctrl+0"), self)
+        self.zoom_reset_shortcut.activated.connect(self.zoom_reset)
+        
         self.update_ui_state()
     
     def on_file_list_clicked(self, item):
         """Handle clicking on a file in the file list."""
-        # Get the index from the list
-        index = self.file_list.row(item)
-        if 0 <= index < len(self.image_files):
-            self.current_index = index
-            self.display_current_image()
+        # In grid-only mode, file list is informational only
+        pass
     
     def update_file_list(self):
         """Update the file list with current images and their status."""
@@ -296,7 +369,11 @@ class ChipOrganizerApp(QMainWindow):
         
         self.current_index = 0
         self.classifications = {}
-        self.display_current_image()
+        self.grid_start_index = 0
+        
+        # Display grid
+        self.display_grid()
+        
         self.update_statistics()
         self.update_ui_state()
         self.update_file_list()
@@ -531,112 +608,223 @@ class ChipOrganizerApp(QMainWindow):
             )
     
     def display_current_image(self):
-        """Display the current image."""
-        if not self.image_files or self.current_index >= len(self.image_files):
-            self.image_label.setText("No image to display")
-            self.info_label.setText("No image loaded")
-            self.status_indicator.setText("Status: No image loaded")
-            self.status_indicator.setStyleSheet(
-                "QLabel { padding: 8px; font-weight: bold; background-color: #e0e0e0; border: 2px solid #999; border-radius: 4px; }"
-            )
-            self.counter_label.setText("0 / 0")
-            return
-        
-        current_file = self.image_files[self.current_index]
-        
-        try:
-            # Load and display image
-            pixmap = QPixmap(str(current_file))
-            
-            # Scale to fit while maintaining aspect ratio
-            scaled_pixmap = pixmap.scaled(
-                self.image_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.image_label.setPixmap(scaled_pixmap)
-            
-            # Update info
-            file_size = current_file.stat().st_size / 1024  # KB
-            self.info_label.setText(
-                f"File: {current_file.name} | Size: {file_size:.1f} KB"
-            )
-            
-            # Update counter (replaces progress bar)
-            self.counter_label.setText(f"{self.current_index + 1} / {len(self.image_files)}")
-            
-            # Update current classification display
-            current_class = self.classifications.get(current_file.name, None)
-            if current_class:
-                self.current_classification_label.setText(f"Current: {current_class}")
-                self.current_classification_label.setStyleSheet(
-                    "QLabel { padding: 10px; background-color: #d4edda; border: 1px solid #c3e6cb; }"
-                )
-                # Update status indicator - labeled
-                self.status_indicator.setText("✓ LABELED")
-                self.status_indicator.setStyleSheet(
-                    "QLabel { padding: 8px; font-weight: bold; color: white; background-color: #28a745; border: 2px solid #1e7e34; border-radius: 4px; }"
-                )
-            else:
-                self.current_classification_label.setText("Current: Not classified")
-                self.current_classification_label.setStyleSheet(
-                    "QLabel { padding: 10px; background-color: #f8d7da; border: 1px solid #f5c6cb; }"
-                )
-                # Update status indicator - not labeled
-                self.status_indicator.setText("⚠ NOT LABELED")
-                self.status_indicator.setStyleSheet(
-                    "QLabel { padding: 8px; font-weight: bold; color: white; background-color: #dc3545; border: 2px solid #bd2130; border-radius: 4px; }"
-                )
-            
-            # Update UI button states
-            self.update_ui_state()
-            
-            # Highlight current file in list
-            if 0 <= self.current_index < self.file_list.count():
-                self.file_list.setCurrentRow(self.current_index)
-            
-        except Exception as e:
-            self.image_label.setText(f"Error loading image: {str(e)}")
+        """No longer used in grid-only mode. Kept for compatibility."""
+        pass
     
     def classify_current_image(self, item):
-        """Classify the current image with the selected category."""
-        if not self.image_files or self.current_index >= len(self.image_files):
-            return
+        """Set the current category for labeling when user selects from list."""
+        self.current_category = item.text()
         
-        category = item.text()
-        current_file = self.image_files[self.current_index]
-        self.classifications[current_file.name] = category
-        
-        self.current_classification_label.setText(f"Current: {category}")
+        # Update current classification display
+        self.current_classification_label.setText(f"Selected Category: {self.current_category}")
         self.current_classification_label.setStyleSheet(
-            "QLabel { padding: 10px; background-color: #d4edda; border: 1px solid #c3e6cb; }"
+            "QLabel { padding: 10px; background-color: #cce5ff; border: 2px solid #007bff; font-weight: bold; }"
         )
         
-        # Update status indicator immediately
-        self.status_indicator.setText("✓ LABELED")
+        # Update status to guide user
+        self.status_indicator.setText(f"Ready to label | Click images to mark as '{self.current_category}'")
+        self.status_indicator.setStyleSheet(
+            "QLabel { padding: 8px; font-weight: bold; background-color: #cce5ff; border: 2px solid #007bff; border-radius: 4px; }"
+        )
+    
+    def configure_grid_size(self):
+        """Allow user to configure grid dimensions."""
+        cols, ok1 = QInputDialog.getInt(
+            self, "Grid Columns", 
+            "Number of columns:", 
+            self.grid_size[0], 1, 20, 1
+        )
+        
+        if not ok1:
+            return
+        
+        rows, ok2 = QInputDialog.getInt(
+            self, "Grid Rows", 
+            "Number of rows:", 
+            self.grid_size[1], 1, 20, 1
+        )
+        
+        if not ok2:
+            return
+        
+        # Update grid size
+        self.grid_size = (cols, rows)
+        self.cols_btn.setText(f"{cols}×{rows}")
+        
+        # Reset to start and redisplay
+        self.grid_start_index = 0
+        if self.image_files:
+            self.display_grid()
+    
+    def display_grid(self):
+        """Display images in grid layout."""
+        # Clear existing grid
+        for i in reversed(range(self.grid_layout.count())):
+            self.grid_layout.itemAt(i).widget().setParent(None)
+        
+        self.grid_labels.clear()
+        
+        if not self.image_files:
+            return
+        
+        cols, rows = self.grid_size
+        images_per_page = cols * rows
+        
+        # Get unlabeled images starting from grid_start_index
+        unlabeled_images = [
+            img for img in self.image_files
+            if img.name not in self.classifications
+        ]
+        
+        if not unlabeled_images:
+            self.status_indicator.setText("All images labeled!")
+            self.status_indicator.setStyleSheet(
+                "QLabel { padding: 8px; font-weight: bold; background-color: #90EE90; border: 2px solid #4CAF50; border-radius: 4px; }"
+            )
+            return
+        
+        # Display images in grid
+        for idx in range(images_per_page):
+            row = idx // cols
+            col = idx % cols
+            
+            img_idx = self.grid_start_index + idx
+            if img_idx >= len(unlabeled_images):
+                break
+            
+            image_path = unlabeled_images[img_idx]
+            
+            # Calculate sizes based on zoom level
+            base_size = 180
+            zoomed_size = int(base_size * self.zoom_level)
+            
+            # Create clickable image label
+            img_widget = ClickableImageLabel(image_path, self)
+            
+            # Apply zoom to widget size constraints
+            img_widget.setMinimumSize(int(150 * self.zoom_level), int(150 * self.zoom_level))
+            img_widget.setMaximumSize(int(200 * self.zoom_level), int(200 * self.zoom_level))
+            
+            # Check if already labeled
+            if image_path.name in self.classifications:
+                img_widget.set_labeled(True)
+            
+            # Load and display image
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                scaled_pixmap = pixmap.scaled(zoomed_size, zoomed_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                img_widget.setPixmap(scaled_pixmap)
+            
+            # Add filename label below image
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.addWidget(img_widget)
+            
+            filename_label = QLabel(image_path.name)
+            filename_label.setAlignment(Qt.AlignCenter)
+            filename_label.setWordWrap(True)
+            filename_label.setMaximumWidth(int(200 * self.zoom_level))
+            font_size = max(8, int(10 * self.zoom_level))  # Scale font but keep minimum readable
+            filename_label.setStyleSheet(f"QLabel {{ font-size: {font_size}px; }}")
+            container_layout.addWidget(filename_label)
+            
+            self.grid_layout.addWidget(container, row, col)
+            self.grid_labels[img_widget] = image_path
+        
+        # Update status
+        labeled_count = len(self.classifications)
+        total_count = len(self.image_files)
+        showing = min(images_per_page, len(unlabeled_images) - self.grid_start_index)
+        self.status_indicator.setText(
+            f"Showing {showing} unlabeled images | Total: {labeled_count}/{total_count} labeled"
+        )
+        self.status_indicator.setStyleSheet(
+            "QLabel { padding: 8px; font-weight: bold; background-color: #e0e0e0; border: 2px solid #999; border-radius: 4px; }"
+        )
+    
+    def on_image_clicked(self, image_widget):
+        """Label image immediately when clicked."""
+        if not self.current_category:
+            QMessageBox.warning(
+                self, "No Category Selected",
+                "Please select a category from the right panel first."
+            )
+            return
+        
+        # Get the image path
+        image_path = self.grid_labels.get(image_widget)
+        if not image_path:
+            return
+        
+        # Label the image
+        self.classifications[image_path.name] = self.current_category
+        image_widget.set_labeled(True)
+        
+        # Update all displays
+        self.update_file_list()
+        self.update_statistics()
+        self.update_ui_state()
+        
+        # Update status
+        labeled_count = len(self.classifications)
+        total_count = len(self.image_files)
+        self.status_indicator.setText(
+            f"✓ Labeled as '{self.current_category}' | Total: {labeled_count}/{total_count} labeled"
+        )
         self.status_indicator.setStyleSheet(
             "QLabel { padding: 8px; font-weight: bold; color: white; background-color: #28a745; border: 2px solid #1e7e34; border-radius: 4px; }"
         )
+    
+    def cycle_labeled_images(self):
+        """Replace labeled images in grid with unlabeled ones."""
+        if not self.image_files:
+            return
         
-        self.update_statistics()
-        self.update_ui_state()
+        # Find labeled images in current grid
+        labeled_in_grid = []
+        for widget, path in self.grid_labels.items():
+            if path.name in self.classifications:
+                labeled_in_grid.append(widget)
+        
+        if not labeled_in_grid:
+            QMessageBox.information(
+                self, "No Labeled Images",
+                "No labeled images in the current grid view."
+            )
+            return
+        
+        # Find unlabeled images not in current grid
+        current_grid_paths = set(self.grid_labels.values())
+        unlabeled_not_in_grid = [
+            img for img in self.image_files
+            if img not in current_grid_paths and img.name not in self.classifications
+        ]
+        
+        if not unlabeled_not_in_grid:
+            QMessageBox.information(
+                self, "No More Unlabeled Images",
+                "All images are either labeled or already displayed in the grid."
+            )
+            return
+        
+        # Replace labeled images with unlabeled ones
+        for widget in labeled_in_grid:
+            if not unlabeled_not_in_grid:
+                break
+            
+            new_image = unlabeled_not_in_grid.pop(0)
+            self.grid_labels[widget] = new_image
+            
+            # Load and display the new image
+            pixmap = QPixmap(str(new_image))
+            if not pixmap.isNull():
+                widget.setPixmap(pixmap.scaled(
+                    widget.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                ))
+                widget.set_labeled(False)
+        
+        # Update file list to reflect new grid contents
         self.update_file_list()
-        
-        # Auto-advance to next image
-        if self.current_index < len(self.image_files) - 1:
-            self.next_image()
-    
-    def previous_image(self):
-        """Go to the previous image."""
-        if self.current_index > 0:
-            self.current_index -= 1
-            self.display_current_image()
-    
-    def next_image(self):
-        """Go to the next image."""
-        if self.current_index < len(self.image_files) - 1:
-            self.current_index += 1
-            self.display_current_image()
     
     def update_statistics(self):
         """Update the statistics display."""
@@ -722,7 +910,7 @@ class ChipOrganizerApp(QMainWindow):
             
             # Update UI
             self.update_category_list()
-            self.display_current_image()
+            self.display_grid()
             self.update_statistics()
             self.update_ui_state()
             self.update_file_list()
@@ -785,15 +973,37 @@ class ChipOrganizerApp(QMainWindow):
                 f"Failed to export images: {str(e)}"
             )
     
+    def zoom_in(self):
+        """Zoom in the grid view."""
+        self.zoom_level = min(self.zoom_level + 0.25, 3.0)  # Max 300%
+        self.apply_zoom()
+    
+    def zoom_out(self):
+        """Zoom out the grid view."""
+        self.zoom_level = max(self.zoom_level - 0.25, 0.25)  # Min 25%
+        self.apply_zoom()
+    
+    def zoom_reset(self):
+        """Reset zoom to 100%."""
+        self.zoom_level = 1.0
+        self.apply_zoom()
+    
+    def apply_zoom(self):
+        """Apply the current zoom level to the grid."""
+        # Update zoom label
+        self.zoom_level_label.setText(f"{int(self.zoom_level * 100)}%")
+        
+        # Redisplay the grid with new zoom level
+        self.display_grid()
+    
     def update_ui_state(self):
         """Update the enabled/disabled state of UI elements."""
         has_images = bool(self.image_files)
         has_ontology = bool(self.ontology)
         
-        self.prev_btn.setEnabled(has_images and self.current_index > 0)
-        self.next_btn.setEnabled(has_images and self.current_index < len(self.image_files) - 1)
         self.save_progress_btn.setEnabled(has_images)
         self.export_btn.setEnabled(bool(self.classifications))
+        self.cycle_labeled_btn.setEnabled(has_images)
     
     def restore_session(self):
         """Restore the last session if available."""
@@ -803,6 +1013,4 @@ class ChipOrganizerApp(QMainWindow):
     def resizeEvent(self, event):
         """Handle window resize events."""
         super().resizeEvent(event)
-        # Redisplay current image to scale properly
-        if self.image_files and self.current_index < len(self.image_files):
-            self.display_current_image()
+        # Grid layout handles resizing automatically
