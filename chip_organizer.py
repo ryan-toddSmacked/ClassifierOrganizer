@@ -54,8 +54,20 @@ class ClickableImageLabel(QLabel):
     
     def update_border(self):
         """Update border color based on state."""
-        if self.is_labeled:
-            self.setStyleSheet("QLabel { border: 3px solid green; background-color: rgba(0, 255, 0, 0.2); }")
+        if self.is_labeled and hasattr(self, 'assigned_category') and self.assigned_category:
+            # Use category color if available
+            color_hex = None
+            try:
+                color_hex = self.app_instance.category_colors.get(self.assigned_category)
+            except Exception:
+                color_hex = None
+
+            if color_hex:
+                c = QColor(color_hex)
+                r, g, b, _ = c.getRgb()
+                self.setStyleSheet(f"QLabel {{ border: 3px solid {color_hex}; background-color: rgba({r}, {g}, {b}, 60); }}")
+            else:
+                self.setStyleSheet("QLabel { border: 3px solid green; background-color: rgba(0, 255, 0, 0.2); }")
         else:
             self.setStyleSheet("QLabel { border: 3px solid gray; }")
 
@@ -81,6 +93,8 @@ class ChipOrganizerApp(QMainWindow):
         self.grid_labels: Dict[ClickableImageLabel, Path] = {}
         self.current_category: Optional[str] = None  # Currently selected category for labeling
         self.zoom_level: float = 1.0  # Zoom level (1.0 = 100%)
+        # Category -> hex color mapping for labeled borders
+        self.category_colors: Dict[str, str] = {}
         
         # Settings
         self.settings = QSettings(APP_NAME, APP_NAME)
@@ -433,8 +447,18 @@ class ChipOrganizerApp(QMainWindow):
             categories = sorted(categories, key=lambda x: str(x).lower())
         
         for category in categories:
+            # Ensure a stable color for each category (generate if missing)
+            if category not in self.category_colors:
+                # Generate a hue from the category name hash for deterministic colors
+                hue = abs(hash(category)) % 360
+                color = QColor.fromHsv(hue, 200, 255)
+                self.category_colors[category] = color.name()
+
             label = format_category_label(category)
-            self.category_list.addItem(label)
+            item = QListWidgetItem(label)
+            # Use a pale background based on category color for the list item
+            item.setBackground(QBrush(QColor(self.category_colors[category]).lighter(150)))
+            self.category_list.addItem(item)
     
     def add_label(self):
         """Add new labels to the category list (supports multiple labels, one per line)."""
@@ -705,9 +729,12 @@ class ChipOrganizerApp(QMainWindow):
             img_widget.setMinimumSize(int(150 * self.zoom_level), int(150 * self.zoom_level))
             img_widget.setMaximumSize(int(200 * self.zoom_level), int(200 * self.zoom_level))
             
-            # Check if already labeled
+            # Check if already labeled and set assigned_category for correct border color
             if image_path.name in self.classifications:
+                img_widget.assigned_category = self.classifications[image_path.name]
                 img_widget.set_labeled(True)
+            else:
+                img_widget.assigned_category = None
             
             # Load and display image
             pixmap = QPixmap(str(image_path))
@@ -728,6 +755,10 @@ class ChipOrganizerApp(QMainWindow):
             filename_label.setStyleSheet(f"QLabel {{ font-size: {font_size}px; }}")
             container_layout.addWidget(filename_label)
             
+            # Attach filename label and container to widget for easy updates when cycling
+            img_widget.filename_label = filename_label
+            img_widget.container = container
+
             self.grid_layout.addWidget(container, row, col)
             self.grid_labels[img_widget] = image_path
         
@@ -758,6 +789,8 @@ class ChipOrganizerApp(QMainWindow):
         
         # Label the image
         self.classifications[image_path.name] = self.current_category
+        # annotate widget so its border can reflect category color
+        image_widget.assigned_category = self.current_category
         image_widget.set_labeled(True)
         
         # Update all displays
@@ -776,55 +809,70 @@ class ChipOrganizerApp(QMainWindow):
         )
     
     def cycle_labeled_images(self):
-        """Replace labeled images in grid with unlabeled ones."""
+        """Cycle the entire grid to the next alphabetical batch of unlabeled images.
+        Labeled images are removed from the master `self.image_files` so they do not
+        reappear; cycling continues page-by-page until all images are labeled.
+        """
         if not self.image_files:
             return
-        
-        # Find labeled images in current grid
-        labeled_in_grid = []
-        for widget, path in self.grid_labels.items():
-            if path.name in self.classifications:
-                labeled_in_grid.append(widget)
-        
-        if not labeled_in_grid:
-            QMessageBox.information(
-                self, "No Labeled Images",
-                "No labeled images in the current grid view."
-            )
+
+        # Remove already labeled images from the master list so they don't show again
+        self.image_files = [img for img in self.image_files if img.name not in self.classifications]
+
+        # Build an alphabetical list of remaining (unlabeled) images
+        unlabeled_images = sorted(self.image_files, key=lambda p: p.name.lower())
+
+        if not unlabeled_images:
+            QMessageBox.information(self, "All Labeled", "All images have been labeled.")
             return
-        
-        # Find unlabeled images not in current grid
-        current_grid_paths = set(self.grid_labels.values())
-        unlabeled_not_in_grid = [
-            img for img in self.image_files
-            if img not in current_grid_paths and img.name not in self.classifications
-        ]
-        
-        if not unlabeled_not_in_grid:
-            QMessageBox.information(
-                self, "No More Unlabeled Images",
-                "All images are either labeled or already displayed in the grid."
-            )
-            return
-        
-        # Replace labeled images with unlabeled ones
-        for widget in labeled_in_grid:
-            if not unlabeled_not_in_grid:
-                break
-            
-            new_image = unlabeled_not_in_grid.pop(0)
-            self.grid_labels[widget] = new_image
-            
-            # Load and display the new image
-            pixmap = QPixmap(str(new_image))
-            if not pixmap.isNull():
-                widget.setPixmap(pixmap.scaled(
-                    widget.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                ))
+
+        cols, rows = self.grid_size
+        images_per_page = cols * rows
+
+        # Reset start if beyond range
+        if self.grid_start_index >= len(unlabeled_images):
+            self.grid_start_index = 0
+
+        start = self.grid_start_index
+        page_images = unlabeled_images[start:start + images_per_page]
+
+        # Iterate current grid widgets and set them to the page images (or clear if none)
+        widgets = list(self.grid_labels.keys())
+        for i, widget in enumerate(widgets):
+            if i < len(page_images):
+                new_image = page_images[i]
+                self.grid_labels[widget] = new_image
+                pixmap = QPixmap(str(new_image))
+                if not pixmap.isNull():
+                    # Respect zoom level when rendering
+                    zoomed_size = int(180 * getattr(self, 'zoom_level', 1.0))
+                    widget.setPixmap(pixmap.scaled(zoomed_size, zoomed_size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                widget.assigned_category = None
                 widget.set_labeled(False)
-        
-        # Update file list to reflect new grid contents
+                if hasattr(widget, 'filename_label'):
+                    widget.filename_label.setText(new_image.name)
+            else:
+                # No image available for this slot: clear display
+                widget.clear()
+                widget.assigned_category = None
+                widget.set_labeled(False)
+                if hasattr(widget, 'filename_label'):
+                    widget.filename_label.setText("")
+                if widget in self.grid_labels:
+                    del self.grid_labels[widget]
+
+        # Advance page
+        self.grid_start_index = start + images_per_page
+
+        # Update UI
         self.update_file_list()
+        self.update_statistics()
+        self.update_ui_state()
+
+        total_unlabeled = len(unlabeled_images)
+        shown_from = start + 1 if total_unlabeled > 0 else 0
+        shown_to = min(self.grid_start_index, total_unlabeled)
+        self.status_indicator.setText(f"Showing {shown_from}-{shown_to} of {total_unlabeled} unlabeled images")
     
     def update_statistics(self):
         """Update the statistics display."""
