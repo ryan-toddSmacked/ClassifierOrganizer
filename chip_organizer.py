@@ -834,7 +834,21 @@ class ChipOrganizerApp(QMainWindow):
             self.grid_start_index = 0
 
         start = self.grid_start_index
-        page_images = unlabeled_images[start:start + images_per_page]
+
+        # Build the page images and wrap-around if necessary so the grid stays full
+        if len(unlabeled_images) <= images_per_page:
+            # fewer images than grid -> show them all (grid will be partially empty)
+            page_images = unlabeled_images[:]
+            end = start + len(page_images)
+        else:
+            end = start + images_per_page
+            if end <= len(unlabeled_images):
+                page_images = unlabeled_images[start:end]
+            else:
+                # wrap to the beginning to fill the page
+                wrap_count = end - len(unlabeled_images)
+                page_images = unlabeled_images[start:]
+                page_images.extend(unlabeled_images[0:wrap_count])
 
         # Iterate current grid widgets and set them to the page images (or clear if none)
         widgets = list(self.grid_labels.keys())
@@ -861,8 +875,12 @@ class ChipOrganizerApp(QMainWindow):
                 if widget in self.grid_labels:
                     del self.grid_labels[widget]
 
-        # Advance page
-        self.grid_start_index = start + images_per_page
+        # Advance page (wrap if needed when there are >= page sized images)
+        if len(unlabeled_images) >= images_per_page:
+            self.grid_start_index = (start + images_per_page) % len(unlabeled_images)
+        else:
+            # keep at 0 when fewer than one page remains
+            self.grid_start_index = 0
 
         # Update UI
         self.update_file_list()
@@ -870,9 +888,8 @@ class ChipOrganizerApp(QMainWindow):
         self.update_ui_state()
 
         total_unlabeled = len(unlabeled_images)
-        shown_from = start + 1 if total_unlabeled > 0 else 0
-        shown_to = min(self.grid_start_index, total_unlabeled)
-        self.status_indicator.setText(f"Showing {shown_from}-{shown_to} of {total_unlabeled} unlabeled images")
+        shown_count = len(page_images)
+        self.status_indicator.setText(f"Showing {shown_count} of {total_unlabeled} unlabeled images (page start {start + 1})")
     
     def update_statistics(self):
         """Update the statistics display."""
