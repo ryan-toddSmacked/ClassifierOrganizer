@@ -42,9 +42,16 @@ class ClickableImageLabel(QLabel):
         self.update_border()
     
     def mousePressEvent(self, event):
-        """Handle mouse click to label image with selected category."""
-        if self.app_instance and hasattr(self.app_instance, 'on_image_clicked'):
-            self.app_instance.on_image_clicked(self)
+        """Dispatch left-click to label, right-click to unassign (if supported)."""
+        # Left click -> normal labeling
+        if event.button() == Qt.LeftButton:
+            if self.app_instance and hasattr(self.app_instance, 'on_image_clicked'):
+                self.app_instance.on_image_clicked(self)
+        # Right click -> unassign label (if app implements handler)
+        elif event.button() == Qt.RightButton:
+            if self.app_instance and hasattr(self.app_instance, 'on_image_right_clicked'):
+                self.app_instance.on_image_right_clicked(self)
+
         super().mousePressEvent(event)
     
     def set_labeled(self, labeled: bool):
@@ -71,6 +78,11 @@ class ClickableImageLabel(QLabel):
         else:
             self.setStyleSheet("QLabel { border: 3px solid gray; }")
 
+    def startDrag(self):
+        """Helper to start a drag programmatically if needed."""
+        # Drag support removed in revert; method left intentionally empty
+        return
+
 
 class ChipOrganizerApp(QMainWindow):
     """Main application window for organizing chip images."""
@@ -95,6 +107,11 @@ class ChipOrganizerApp(QMainWindow):
         self.zoom_level: float = 1.0  # Zoom level (1.0 = 100%)
         # Category -> hex color mapping for labeled borders
         self.category_colors: Dict[str, str] = {}
+        # Category -> example image path mapping (may be empty if examples disabled)
+        self.category_examples: Dict[str, Path] = {}
+        # State for interactive "set example" flow
+        self.awaiting_example_selection: bool = False
+        self.pending_example_category: Optional[str] = None
         
         # Settings
         self.settings = QSettings(APP_NAME, APP_NAME)
@@ -134,6 +151,11 @@ class ChipOrganizerApp(QMainWindow):
         self.export_btn = QPushButton("Export Sorted Images")
         self.export_btn.clicked.connect(self.export_images)
         toolbar_layout.addWidget(self.export_btn)
+
+        # Help button
+        self.help_btn = QPushButton("Help")
+        self.help_btn.clicked.connect(self.show_help)
+        toolbar_layout.addWidget(self.help_btn)
         
         # Export mode checkbox (compact)
         self.copy_mode_checkbox = QCheckBox("Copy mode")
@@ -209,11 +231,7 @@ class ChipOrganizerApp(QMainWindow):
         self.zoom_in_btn.clicked.connect(self.zoom_in)
         grid_controls.addWidget(self.zoom_in_btn)
         
-        self.zoom_reset_btn = QPushButton("Reset")
-        self.zoom_reset_btn.setMaximumWidth(60)
-        self.zoom_reset_btn.setToolTip("Reset Zoom (Ctrl+0)")
-        self.zoom_reset_btn.clicked.connect(self.zoom_reset)
-        grid_controls.addWidget(self.zoom_reset_btn)
+        # Reset button removed per user request (Ctrl+0 shortcut remains)
         
         grid_controls.addSpacing(20)
         
@@ -283,7 +301,12 @@ class ChipOrganizerApp(QMainWindow):
         self.remove_label_btn = QPushButton("- Remove Label")
         self.remove_label_btn.clicked.connect(self.remove_label)
         label_buttons_layout.addWidget(self.remove_label_btn)
-        
+
+        # Set example image button
+        self.set_example_btn = QPushButton("Set Example Image")
+        self.set_example_btn.clicked.connect(self.start_set_example)
+        label_buttons_layout.addWidget(self.set_example_btn)
+
         ontology_layout.addLayout(label_buttons_layout)
         
         # Export labels button
@@ -298,6 +321,13 @@ class ChipOrganizerApp(QMainWindow):
         )
         ontology_layout.addWidget(self.current_classification_label)
         
+        # Category example preview
+        self.category_example_label = QLabel()
+        self.category_example_label.setFixedSize(160, 160)
+        self.category_example_label.setAlignment(Qt.AlignCenter)
+        self.category_example_label.setVisible(False)
+        ontology_layout.addWidget(self.category_example_label)
+
         right_layout.addWidget(ontology_group)
         
         # Statistics
@@ -318,13 +348,18 @@ class ChipOrganizerApp(QMainWindow):
         # Setup keyboard shortcuts for zoom
         self.zoom_in_shortcut = QShortcut(QKeySequence("Ctrl++"), self)
         self.zoom_in_shortcut.activated.connect(self.zoom_in)
-        
+
         self.zoom_out_shortcut = QShortcut(QKeySequence("Ctrl+-"), self)
         self.zoom_out_shortcut.activated.connect(self.zoom_out)
-        
+
         self.zoom_reset_shortcut = QShortcut(QKeySequence("Ctrl+0"), self)
         self.zoom_reset_shortcut.activated.connect(self.zoom_reset)
-        
+
+        # Global Space shortcut to cycle images (works regardless of widget focus)
+        self.cycle_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
+        self.cycle_shortcut.setContext(Qt.ApplicationShortcut)
+        self.cycle_shortcut.activated.connect(self.cycle_labeled_images)
+
         self.update_ui_state()
     
     def on_file_list_clicked(self, item):
@@ -456,9 +491,20 @@ class ChipOrganizerApp(QMainWindow):
 
             label = format_category_label(category)
             item = QListWidgetItem(label)
+            # store canonical category value for later lookup
+            item.setData(Qt.UserRole, category)
             # Use a pale background based on category color for the list item
             item.setBackground(QBrush(QColor(self.category_colors[category]).lighter(150)))
             self.category_list.addItem(item)
+            # If there is an example already set for this category, and the category is currently selected, update preview
+            if self.current_category and self.current_category == category:
+                example = self.category_examples.get(category)
+                if example and example.exists():
+                    pix = QPixmap(str(example))
+                    if not pix.isNull():
+                        scaled = pix.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        self.category_example_label.setPixmap(scaled)
+                        self.category_example_label.setVisible(True)
     
     def add_label(self):
         """Add new labels to the category list (supports multiple labels, one per line)."""
@@ -637,10 +683,12 @@ class ChipOrganizerApp(QMainWindow):
     
     def classify_current_image(self, item):
         """Set the current category for labeling when user selects from list."""
-        self.current_category = item.text()
-        
+        # Use canonical category stored in item data if available
+        cat = item.data(Qt.UserRole) if item.data(Qt.UserRole) else item.text()
+        self.current_category = cat
+
         # Update current classification display
-        self.current_classification_label.setText(f"Selected Category: {self.current_category}")
+        self.current_classification_label.setText(f"Selected Category: {format_category_label(self.current_category)}")
         self.current_classification_label.setStyleSheet(
             "QLabel { padding: 10px; background-color: #cce5ff; border: 2px solid #007bff; font-weight: bold; }"
         )
@@ -650,6 +698,124 @@ class ChipOrganizerApp(QMainWindow):
         self.status_indicator.setStyleSheet(
             "QLabel { padding: 8px; font-weight: bold; background-color: #cce5ff; border: 2px solid #007bff; border-radius: 4px; }"
         )
+        # Show category example if present
+        example = self.category_examples.get(self.current_category)
+        if example and example.exists():
+            pix = QPixmap(str(example))
+            if not pix.isNull():
+                scaled = pix.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.category_example_label.setPixmap(scaled)
+                self.category_example_label.setVisible(True)
+        else:
+            self.category_example_label.clear()
+            self.category_example_label.setVisible(False)
+
+    def set_category_example(self, category: str, image_path: Path):
+        """Assign an example image to a category (called from drop event)."""
+        if not category:
+            return
+        if not image_path.exists():
+            QMessageBox.warning(self, "Invalid Image", f"Example image not found: {image_path}")
+            return
+
+        self.category_examples[category] = image_path
+        # Update preview if currently selected
+        if self.current_category == category:
+            pix = QPixmap(str(image_path))
+            if not pix.isNull():
+                scaled = pix.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.category_example_label.setPixmap(scaled)
+                self.category_example_label.setVisible(True)
+
+        self.status_indicator.setText(f"Set example for '{format_category_label(category)}'")
+
+    def start_set_example(self):
+        """Begin interactive flow to set an example image for a category.
+        Pressing the button will prompt the user to pick a category, then the next
+        image click in the grid will assign that image as the category example.
+        Pressing the button again cancels the flow.
+        """
+        # If already awaiting, cancel
+        if getattr(self, 'awaiting_example_selection', False):
+            self.awaiting_example_selection = False
+            self.pending_example_category = None
+            try:
+                self.set_example_btn.setText("Set Example Image")
+            except Exception:
+                pass
+            self.status_indicator.setText("Set example cancelled.")
+            return
+
+        # Get categories
+        categories = get_categories_from_ontology(self.ontology)
+        if not categories:
+            QMessageBox.warning(self, "No Categories", "No categories available. Load or create labels first.")
+            return
+
+        # Preselect current category if available
+        current_index = 0
+        if self.current_category in categories:
+            try:
+                current_index = categories.index(self.current_category)
+            except Exception:
+                current_index = 0
+
+        category, ok = QInputDialog.getItem(
+            self, "Choose Category", "Select category to set example for:", categories, current_index, False
+        )
+        if not ok or not category:
+            return
+
+        # Enter awaiting state
+        self.pending_example_category = category
+        self.awaiting_example_selection = True
+        try:
+            self.set_example_btn.setText("Cancel Set Example")
+        except Exception:
+            pass
+        self.status_indicator.setText(f"Click an image to set example for '{format_category_label(category)}'")
+
+    def show_help(self):
+        """Open a help dialog listing shortcuts and basic usage."""
+        from PyQt5.QtWidgets import QDialog, QTextEdit, QDialogButtonBox
+
+        help_text = (
+            "<h2>Chip Organizer — Shortcuts & Usage</h2>"
+            "<ul>"
+            "<li><b>Space</b>: Cycle to the next alphabetical batch of unlabeled images.</li>"
+            "<li><b>Ctrl++</b>: Zoom In</li>"
+            "<li><b>Ctrl+-</b>: Zoom Out</li>"
+            "<li><b>Ctrl+0</b>: Reset Zoom</li>"
+            "</ul>"
+            "<h3>Labeling Workflow</h3>"
+            "<ul>"
+            "<li>Select a category in the right panel, then left-click any image in the grid to assign that category.</li>"
+            "<li>Right-click an image to un-select (remove its label).</li>"
+            "<li>Use the <i>Set Example Image</i> button to choose a category and then click an image to set it as the example shown when that category is selected.</li>"
+            "</ul>"
+            "<h3>Files & Progress</h3>"
+            "<ul>"
+            "<li>Load images with <b>Load Images</b>. Load or create labels with <b>Load Ontology</b>.</li>"
+            "<li>Save progress with <b>Save Progress</b> and reload with <b>Load Progress</b>.</li>"
+            "<li>Export sorted images using <b>Export Sorted Images</b>. Use <b>Copy mode</b> checkbox to toggle move vs copy.</li>"
+            "</ul>"
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Help — Shortcuts & Usage")
+        dlg.setMinimumSize(540, 360)
+        layout = QVBoxLayout(dlg)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setHtml(help_text)
+        layout.addWidget(text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        dlg.exec_()
     
     def configure_grid_size(self):
         """Allow user to configure grid dimensions."""
@@ -775,6 +941,28 @@ class ChipOrganizerApp(QMainWindow):
     
     def on_image_clicked(self, image_widget):
         """Label image immediately when clicked."""
+        # If we're in the middle of setting an example, use this click to set it
+        if getattr(self, 'awaiting_example_selection', False):
+            image_path = self.grid_labels.get(image_widget)
+            if not image_path:
+                QMessageBox.warning(self, "No Image", "Couldn't determine which image was clicked.")
+                return
+            category = self.pending_example_category
+            if not category:
+                QMessageBox.warning(self, "No Category", "No target category selected for example.")
+                return
+            # Set example for category (this will update preview if appropriate)
+            self.set_category_example(category, image_path)
+            # Reset interactive state
+            self.awaiting_example_selection = False
+            self.pending_example_category = None
+            try:
+                self.set_example_btn.setText("Set Example Image")
+            except Exception:
+                pass
+            QMessageBox.information(self, "Example Set", f"Set example for '{format_category_label(category)}'.")
+            self.status_indicator.setText(f"Set example for '{format_category_label(category)}'.")
+            return
         if not self.current_category:
             QMessageBox.warning(
                 self, "No Category Selected",
@@ -807,6 +995,38 @@ class ChipOrganizerApp(QMainWindow):
         self.status_indicator.setStyleSheet(
             "QLabel { padding: 8px; font-weight: bold; color: white; background-color: #28a745; border: 2px solid #1e7e34; border-radius: 4px; }"
         )
+
+    def on_image_right_clicked(self, image_widget):
+        """Unassign label from an image when right-clicked.
+
+        This removes the classification (if present) and updates UI.
+        """
+        image_path = self.grid_labels.get(image_widget)
+        if not image_path:
+            return
+
+        # If the image is classified, remove the classification
+        if image_path.name in self.classifications:
+            old_cat = self.classifications.pop(image_path.name)
+            image_widget.assigned_category = None
+            image_widget.set_labeled(False)
+
+            # Update UI state
+            self.update_file_list()
+            self.update_statistics()
+            self.update_ui_state()
+
+            # Update status indicator
+            self.status_indicator.setText(f"Removed label '{format_category_label(old_cat)}' from {image_path.name}")
+            self.status_indicator.setStyleSheet(
+                "QLabel { padding: 8px; font-weight: bold; background-color: #ffc107; border: 2px solid #ff9800; border-radius: 4px; }"
+            )
+        else:
+            # No-op if image wasn't labeled; provide subtle feedback
+            self.status_indicator.setText("Image not labeled")
+            self.status_indicator.setStyleSheet(
+                "QLabel { padding: 8px; font-weight: bold; background-color: #e0e0e0; border: 2px solid #999; border-radius: 4px; }"
+            )
     
     def cycle_labeled_images(self):
         """Cycle the entire grid to the next alphabetical batch of unlabeled images.
@@ -935,7 +1155,8 @@ class ChipOrganizerApp(QMainWindow):
                 'source_directory': str(self.source_directory),
                 'current_index': self.current_index,
                 'classifications': self.classifications,
-                'ontology': self.ontology
+                'ontology': self.ontology,
+                'category_examples': {k: str(v) for k, v in self.category_examples.items()}
             }
             
             with open(filename, 'w', encoding='utf-8') as f:
@@ -969,6 +1190,9 @@ class ChipOrganizerApp(QMainWindow):
             self.current_index = progress_data.get('current_index', 0)
             self.classifications = progress_data.get('classifications', {})
             self.ontology = progress_data.get('ontology', {})
+            # Load category example mappings if present
+            examples = progress_data.get('category_examples', {})
+            self.category_examples = {k: Path(v) for k, v in examples.items()} if examples else {}
             
             # Reload images from source directory using utility function
             self.image_files = find_image_files(self.source_directory, SUPPORTED_FORMATS)
